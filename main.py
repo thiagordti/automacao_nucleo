@@ -172,8 +172,8 @@ class InterfaceRoboFusion:
                 lista_historico = []
                 arquivos_txt = [f for f in os.listdir(setor_dir) if f.endswith('.txt')]
                 
-                for arquivo in arquivos_txt:
-                    dados = self.robo.extrair_dados_do_txt(setor, arquivo)
+                dados_list = self.robo.processar_arquivos_batch(setor, arquivos_txt)
+                for dados in dados_list:
                     if dados:
                         lista_historico.append(dados)
                 

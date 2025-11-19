@@ -1,11 +1,16 @@
 from tkinter import messagebox
 from utils import *
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Semaphore
+import time
 import random
 
 
 class RoboRequest:
-    def __init__(self):
-        pass
+    def __init__(self, max_workers=3, requests_per_second=2):
+        self.max_workers = max_workers
+        self.rate_limiter = Semaphore(requests_per_second)
+        self.request_interval = 1.0 / requests_per_second
 
     def iniciar_navegador(self):
         navegador, chrome_proc = iniciar_navegador() # Inicia o navegador e conecta ao Chrome em modo debug
@@ -24,6 +29,61 @@ class RoboRequest:
     def caminho_salvar_arquivo(self):
         return selecionar_caminho_para_salvar() # Abre uma janela para selecionar o caminho de salvamento do arquivo
     
+    def fazer_requisicao_fusion(self,session, headers, form_id):
+        """
+        Faz requisição AJAX para o Fusion e retorna o response.
+        
+        Args:
+            session: requests.Session com cookies
+            headers: dict com headers
+            form_id: ID do formulário (ex: 363321568)
+        
+        Returns:
+            dict com response_data e status_code
+        """
+        url = f"https://fusion.fiemg.com.br/fusion/portal/ajaxRender/Form"
+        
+        params = {
+            'content': 'true',
+            'id': form_id,
+            'showContainer': 'false',
+            'disableFooter': 'true',
+            'full': 'true',
+            'edit': 'false',
+            'type': 'DSSNAFPDadosDaSolicitacao'
+        }
+        
+        try:
+            response = session.get(url, params=params, headers=headers, timeout=30)
+            
+            print(f"Status Code: {response.status_code}")
+            print(f"Content-Type: {response.headers.get('Content-Type')}")
+            
+            # Tentar parsear como JSON
+            try:
+                data = response.json()
+                return {
+                    'success': True,
+                    'status_code': response.status_code,
+                    'data': data,
+                    'raw_text': response.text[:500]  # primeiros 500 chars
+                }
+            except:
+                # Se não for JSON, retornar HTML/texto
+                return {
+                    'success': True,
+                    'status_code': response.status_code,
+                    'data': None,
+                    'raw_text': response.text[:500],
+                    'full_html': response.text
+                }
+        
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }
+
     def fazer_requisicao_wfprocess(self, navegador, setor, data_busca, offset=0, range_size=100):
         """
         Faz requisição direta ao endpoint WFProcess usando sessão do navegador.
@@ -222,7 +282,6 @@ class RoboRequest:
         while len(dict_processos_raw) < numero_chamados:
             print(f"\n📤 Requisição: offset={offset}, range={range_size}")
             
-            # Fazer requisição
             resultado = self.fazer_requisicao_wfprocess(
                 navegador=navegador,
                 setor=setor,
@@ -235,7 +294,6 @@ class RoboRequest:
                 print("❌ Falha na requisição. Encerrando coleta.")
                 break
             
-            # Adicionar novos processos ao dicionário
             processos_novos = 0
             for code, process_id in resultado.items():
                 if code not in dict_processos_raw:
@@ -245,15 +303,11 @@ class RoboRequest:
             print(f"✅ Novos processos obtidos: {processos_novos}")
             print(f"📊 Total acumulado: {len(dict_processos_raw)}/{numero_chamados}")
             
-            # Se não obteve nenhum processo novo, significa que chegou ao fim
             if processos_novos == 0:
                 print("⚠️ Não há mais processos disponíveis.")
                 break
             
-            # Incrementar offset para próxima página
             offset += range_size
-            
-            # ✅ SIMULAR TEMPO DE ESPERA HUMANO
             tempo_espera = random.uniform(2.0, 4.0)
             print(f"⏳ Aguardando {tempo_espera:.1f}s antes da próxima requisição...")
             time.sleep(tempo_espera)
@@ -261,10 +315,10 @@ class RoboRequest:
         print("\n" + "=" * 60)
         print(f"✅ Coleta concluída: {len(dict_processos_raw)} processos")
         
-        # ✅ FILTRAR PROCESSOS E OBTER ENTITY_IDs
-        dict_processos = {}  # {code: entity_id} - IDs finais para requisição
+        # ✅ FILTRAR PROCESSOS QUE PRECISAM DE ENTITY_ID
+        dict_processos_filtrados = {}  # {code: process_id} - Processos que precisam ser baixados
         
-        print("\n🔍 Filtrando processos e obtendo EntityIDs...")
+        print("\n🔍 Filtrando processos...")
         print("-" * 60)
         
         for idx, (process_code, process_id) in enumerate(dict_processos_raw.items(), 1):
@@ -280,62 +334,45 @@ class RoboRequest:
                 
                 if not processo_existe:
                     deve_obter = True
-                    print(f"[{idx}/{len(dict_processos_raw)}] 📋 {numero_limpo}: Não encontrado na planilha -> Obtendo EntityID")
+                    print(f"[{idx}/{len(dict_processos_raw)}] 📋 {numero_limpo}: Não encontrado -> Marcado para download")
                 else:
                     linha_processo = planilha_referencia[planilha_referencia['numero_chamado'].str.contains(numero_limpo, na=False)]
                     if not linha_processo.empty:
                         acao_nucleo_atual = linha_processo['acao_nucleo'].iloc[0]
                         if acao_nucleo_atual != "Concluir Atendimento":
                             deve_obter = True
-                            print(f"[{idx}/{len(dict_processos_raw)}] 📋 {numero_limpo}: Status '{acao_nucleo_atual}' -> Obtendo EntityID")
+                            print(f"[{idx}/{len(dict_processos_raw)}] 📋 {numero_limpo}: Status '{acao_nucleo_atual}' -> Marcado para download")
                         else:
                             print(f"[{idx}/{len(dict_processos_raw)}] ⏭️ {numero_limpo}: Já concluído -> Pulando")
             else:
                 deve_obter = True
-                print(f"[{idx}/{len(dict_processos_raw)}] 📋 {numero_limpo}: Sem planilha referência -> Obtendo EntityID")
+                print(f"[{idx}/{len(dict_processos_raw)}] 📋 {numero_limpo}: Sem planilha referência -> Marcado para download")
             
-            # ✅ OBTER ENTITY_ID
             if deve_obter:
-                entity_id = self.obter_entity_id_do_processo(session, headers, str(process_id))
-                
-                if entity_id:
-                    dict_processos[process_code] = int(entity_id)
-                else:
-                    print(f"⚠️ EntityId não obtido para {process_code}")
-                
-                # Tempo de espera entre requisições
-                time.sleep(random.uniform(0.5, 2.0))
+                dict_processos_filtrados[process_code] = process_id
         
         print("\n" + "=" * 60)
-        print(f"✅ Processos com EntityId: {len(dict_processos)}")
+        print(f"✅ Processos filtrados: {len(dict_processos_filtrados)}/{len(dict_processos_raw)}")
         
-        # ✅ FAZER REQUISIÇÕES DOS FORMULÁRIOS
-        print("\n📥 Baixando dados dos processos...")
+        # ✅ OBTER ENTITY_IDs EM PARALELO
+        print("\n🔄 Obtendo EntityIDs em paralelo...")
         print("-" * 60)
         
-        erros_totais = 0
+        dict_processos = self.obter_entity_ids_batch(session, headers, dict_processos_filtrados)
         
-        for idx, (processo, entity_id) in enumerate(dict_processos.items(), 1):
-            form_id = str(entity_id)
-            
-            print(f"[{idx}/{len(dict_processos)}] 📥 {processo} (EntityID: {form_id})")
-            
-            resultado = fazer_requisicao_fusion(session, headers, form_id)
-            html_completo = resultado.get('full_html', '')
-            
-            if not html_completo:
-                erros_totais += 1
-                print(f"❌ Erro ao obter dados")
-                continue
-            
-            salvar_resposta_em_txt(resultado, os.path.join(setor_dir, f"resposta_fusion_{form_id}.txt"))
-            print(f"✅ Arquivo salvo")
-            
-            time.sleep(random.uniform(0.5, 2.0))
+        print("\n" + "=" * 60)
+        print(f"✅ EntityIDs obtidos: {len(dict_processos)}")
+        
+        # ✅ BAIXAR DADOS DOS PROCESSOS EM PARALELO
+        print("\n📥 Baixando dados dos processos em paralelo...")
+        print("-" * 60)
+        
+        erros_totais = self.baixar_dados_processos_batch(session, headers, dict_processos, setor_dir)
         
         print("\n" + "=" * 60)
         print(f"📊 Resumo Final:")
         print(f"   Processos coletados: {len(dict_processos_raw)}")
+        print(f"   Processos filtrados: {len(dict_processos_filtrados)}")
         print(f"   EntityIDs obtidos: {len(dict_processos)}")
         print(f"   Arquivos salvos: {len(dict_processos) - erros_totais}")
         print(f"   Erros: {erros_totais}")
@@ -346,76 +383,73 @@ class RoboRequest:
     def extrair_dados_do_txt(self, setor, nome_arquivo):
         """
         Lê um arquivo TXT e extrai os dados usando as mesmas lógicas do Selenium.
-        
-        Args:
-            caminho_arquivo: Caminho para o arquivo TXT
-        
-        Returns:
-            Lista com os dados extraídos na mesma ordem que o Selenium
         """
         try:
+            print(f"📄 Iniciando extração: {nome_arquivo}")
+            
             caminho_arquivo = os.path.join(getattr(self, "setor_dir", ""), nome_arquivo)
-            # Ler o arquivo
+            
+            # ✅ Ler arquivo
+            print("  ⏳ Lendo arquivo...")
             with open(caminho_arquivo, 'r', encoding='utf-8') as f:
                 conteudo = f.read()
             
-            # Extrair apenas o HTML (após "TIPO: HTML/TEXTO COMPLETO")
+            # ✅ Extrair HTML
+            print("  ⏳ Extraindo HTML...")
             if 'TIPO: HTML/TEXTO COMPLETO' in conteudo:
                 html_content = conteudo.split('TIPO: HTML/TEXTO COMPLETO')[1]
                 html_content = html_content.split('=' * 80)[0]
             else:
                 html_content = conteudo
             
-            # Parsear HTML
-            soup = BeautifulSoup(html_content, 'html.parser')
+            # ✅ Parsear HTML UMA VEZ com parser mais rápido
+            print("  ⏳ Parseando HTML...")
+            soup = BeautifulSoup(html_content, 'lxml')  # 'lxml' é mais rápido que 'html.parser'
             
-            # Função auxiliar MELHORADA para buscar por ID ou div pai
-            def get_text(element_id, buscar_em_pai=False):
-                """
-                Busca texto por ID preservando quebras de linha (<br>) como '\n'.
-                """
-                el = soup.find(id=element_id)
+            # ✅ CACHE: Criar dicionário de elementos por ID (parsing único)
+            print("  ⏳ Criando cache de elementos...")
+            elementos_cache = {el.get('id'): el for el in soup.find_all(id=True) if el.get('id')}
+            
+            # Função otimizada com cache
+            def get_text_cached(element_id, buscar_em_pai=False):
+                """Versão otimizada com cache de elementos"""
+                el = elementos_cache.get(element_id)
                 if not el:
                     return " "
                 
-                # Se precisa buscar no elemento pai (ex: div_Codigo__ -> div.text-wrapper)
                 if buscar_em_pai:
                     text_wrapper = el.find('div', class_='text-wrapper')
                     if text_wrapper:
-                        # ✅ CONVERTER <br> EM \n NO HTML INTERNO
                         html_interno = str(text_wrapper)
                         html_interno = html_interno.replace('<br>', '\n').replace('<br/>', '\n').replace('<br />', '\n')
-                        # Parsear novamente para pegar o texto
-                        temp_soup = BeautifulSoup(html_interno, 'html.parser')
-                        texto = temp_soup.get_text()
-                        texto = html_lib.unescape(texto)
-                        return texto.strip()
-                    
-
-                if el.name == 'label':
-                    parent = el.parent
-                    if parent:
-                        # Remover o próprio label e outros labels do parent
-                        for label_tag in parent.find_all('label'):
-                            label_tag.decompose()
-                        # Remover tags indesejadas
-                        for tag in parent.find_all(['script', 'style', 'input', 'select', 'textarea', 'img']):
-                            tag.decompose()
-                        # Converter <br> em \n
-                        html_interno = str(parent)
-                        html_interno = html_interno.replace('<br>', '\n').replace('<br/>', '\n').replace('<br />', '\n')
-                        temp_soup = BeautifulSoup(html_interno, 'html.parser')
+                        temp_soup = BeautifulSoup(html_interno, 'lxml')
                         texto = temp_soup.get_text()
                         texto = html_lib.unescape(texto)
                         return texto.strip()
                 
-                # Para inputs hidden, buscar texto no parent
+                if el.name == 'label':
+                    parent = el.parent
+                    if parent:
+                        # Clonar para não modificar o original
+                        parent_copy = BeautifulSoup(str(parent), 'lxml').find()
+                        for label_tag in parent_copy.find_all('label'):
+                            label_tag.decompose()
+                        for tag in parent_copy.find_all(['script', 'style', 'input', 'select', 'textarea', 'img']):
+                            tag.decompose()
+                        
+                        html_interno = str(parent_copy)
+                        html_interno = html_interno.replace('<br>', '\n').replace('<br/>', '\n').replace('<br />', '\n')
+                        temp_soup = BeautifulSoup(html_interno, 'lxml')
+                        texto = temp_soup.get_text()
+                        texto = html_lib.unescape(texto)
+                        return texto.strip()
+                
                 if el.name == 'input' and el.get('type') == 'hidden':
                     parent = el.parent
                     if parent:
                         html_interno = str(parent)
                         html_interno = html_interno.replace('<br>', '\n').replace('<br/>', '\n').replace('<br />', '\n')
-                        temp_soup = BeautifulSoup(html_interno, 'html.parser')
+                        temp_soup = BeautifulSoup(html_interno, 'lxml')
                         parent_text = temp_soup.get_text()
                         input_value = el.get('value', '')
                         if input_value and input_value in parent_text:
@@ -423,32 +457,23 @@ class RoboRequest:
                         parent_text = html_lib.unescape(parent_text)
                         return parent_text.strip()
                 
-                # Remover scripts, styles, inputs
-                for tag in el.find_all(['script', 'style', 'input', 'select', 'textarea']):
+                # Clonar elemento para não modificar o original
+                el_copy = BeautifulSoup(str(el), 'lxml').find()
+                for tag in el_copy.find_all(['script', 'style', 'input', 'select', 'textarea']):
                     tag.decompose()
                 
-                # ✅ CONVERTER <br> EM \n NO HTML INTERNO DO ELEMENTO
-                html_interno = str(el)
+                html_interno = str(el_copy)
                 html_interno = html_interno.replace('<br>', '\n').replace('<br/>', '\n').replace('<br />', '\n')
-                
-                # Parsear novamente para pegar o texto com as quebras de linha
-                temp_soup = BeautifulSoup(html_interno, 'html.parser')
+                temp_soup = BeautifulSoup(html_interno, 'lxml')
                 texto = temp_soup.get_text()
                 texto = html_lib.unescape(texto)
                 return texto.strip()
-            # Função para tabelas (sem mudanças)
-            def parse_data_textarea_soup(soup, textarea_id):
-                """
-                Parseia o conteúdo de uma textarea específica identificada por seu ID,
-                extraindo informações de responsável, data e mensagem.
-                Args:
-                    soup: Objeto BeautifulSoup do HTML completo
-                    textarea_id: ID da textarea a ser parseada
-                Returns:
-                    Lista com as entradas extraídas no formato "Responsável ; Data ; Mensagem"
-                """
+            
+            # ✅ Manter parse_data_textarea_soup otimizado
+            def parse_data_textarea_soup(textarea_id):
+                """Versão otimizada com cache"""
                 try:
-                    ta = soup.find(id=textarea_id)
+                    ta = elementos_cache.get(textarea_id)
                     if not ta:
                         return [" "]
 
@@ -456,30 +481,24 @@ class RoboRequest:
                     if not xml_content:
                         return [" "]
                     
-                    # ✅ PRIMEIRO UNESCAPE
                     xml_content = html_lib.unescape(xml_content)
-                    inner = BeautifulSoup(xml_content, "html.parser")
+                    inner = BeautifulSoup(xml_content, "lxml")
 
-                    # ✅ BUSCAR E PROCESSAR SEÇÕES CDATA
                     responsavel = ""
                     data = ""
                     mensagem = ""
 
-                    # 1. RESPONSÁVEL: Buscar no primeiro CDATA que contém input hidden
                     cdata_sections = inner.find_all(string=True)
+                    
                     for cdata in cdata_sections:
                         cdata_text = str(cdata).strip()
                         
-                        # Se contém input hidden com responsavel
                         if 'responsavel' in cdata_text and 'input' in cdata_text:
-                            # ✅ SEGUNDO UNESCAPE para decodificar &lt; &gt; &#39; etc.
                             decoded_cdata = html_lib.unescape(cdata_text)
-                            temp_soup = BeautifulSoup(decoded_cdata, 'html.parser')
+                            temp_soup = BeautifulSoup(decoded_cdata, 'lxml')
                             
-                            # Buscar input hidden
                             input_el = temp_soup.find('input', type='hidden')
                             if input_el:
-                                # Pegar texto após o input
                                 parent_text = temp_soup.get_text()
                                 input_value = input_el.get('value', '')
                                 if input_value:
@@ -487,52 +506,41 @@ class RoboRequest:
                                 responsavel = parent_text.strip()
                                 break
 
-                    # 2. DATA: Buscar span com id contendo 'data__'
                     for cdata in cdata_sections:
                         cdata_text = str(cdata).strip()
                         
                         if 'data__' in cdata_text and 'span' in cdata_text:
-                            # ✅ SEGUNDO UNESCAPE
                             decoded_cdata = html_lib.unescape(cdata_text)
-                            temp_soup = BeautifulSoup(decoded_cdata, 'html.parser')
+                            temp_soup = BeautifulSoup(decoded_cdata, 'lxml')
                             
-                            # Buscar span de data
                             date_span = temp_soup.find('span', id=lambda x: x and 'data__' in x)
                             if date_span:
                                 data = date_span.get_text(strip=True)
                                 break
 
-                    # 3. MENSAGEM: Buscar span com title (tooltip)
                     for cdata in cdata_sections:
                         cdata_text = str(cdata).strip()
                         
                         if 'tooltip' in cdata_text and 'title' in cdata_text:
-                            # ✅ SEGUNDO UNESCAPE
                             decoded_cdata = html_lib.unescape(cdata_text)
-                            temp_soup = BeautifulSoup(decoded_cdata, 'html.parser')
+                            temp_soup = BeautifulSoup(decoded_cdata, 'lxml')
                             
-                            # Buscar span com title
                             msg_span = temp_soup.find('span', title=True)
                             if msg_span:
                                 mensagem = msg_span.get('title', '')
-                                # ✅ TERCEIRO UNESCAPE para a mensagem (pode estar triplo-escapada)
                                 mensagem = html_lib.unescape(mensagem)
                                 break
 
-                    # 4. BUSCAR NA TAG <overview> como fallback para mensagem
                     if not mensagem:
                         overview_tag = inner.find('overview')
                         if overview_tag:
                             overview_content = overview_tag.get_text(strip=True)
                             if overview_content:
-                                # ✅ SEGUNDO UNESCAPE
                                 mensagem = html_lib.unescape(overview_content)
 
-                    # Limpeza final
                     responsavel = responsavel.replace(textarea_id.replace('data_', ''), '').strip()
                     data = data.replace('Data.:', '').replace('Data:', '').strip()
                     
-                    # Remover duplicações na mensagem
                     def _collapse_double(s):
                         s = s.strip()
                         n = len(s)
@@ -552,81 +560,104 @@ class RoboRequest:
                         return [" "]
                         
                 except Exception as e:
+                    print(f"    ⚠️ Erro ao parsear textarea {textarea_id}: {e}")
                     return [" "]
             
-            def get_data_textarea_ids_from_soup(soup, container_div_id=None, allow_global_fallback=True): # Obtém IDs de textareas data_ dentro de um container específico ou globalmente
-                ids = [] # Lista para armazenar os IDs encontrados
-                if container_div_id: # Se um ID de container for fornecido, buscar dentro dele
-                    container = soup.find(id=container_div_id) # Encontrar o container pelo ID
-                    if container: # Se o container for encontrado
-                        ids.extend( # Extrair IDs de textareas data_ dentro do container
-                            ta.get('id') # Obter o ID do textarea
-                            for ta in container.find_all('textarea', id=lambda v: v and v.startswith('data_')) # Filtrar textareas com ID começando com 'data_'
+            def get_data_textarea_ids_from_soup(container_div_id=None, allow_global_fallback=True):
+                """Versão otimizada com cache"""
+                ids = []
+                
+                if container_div_id:
+                    container = elementos_cache.get(container_div_id)
+                    if container:
+                        ids.extend(
+                            ta.get('id')
+                            for ta in container.find_all('textarea', id=lambda v: v and v.startswith('data_'))
                         )
-                if not ids and allow_global_fallback: # Se nenhum ID foi encontrado e o fallback global é permitido
-                    ids.extend( # Extrair IDs de textareas data_ globalmente
-                        ta.get('id') # Obter o ID do textarea
-                        for ta in soup.find_all('textarea', id=lambda v: v and v.startswith('data_')) # Filtrar textareas com ID começando com 'data_'
-                    ) 
-                return [i for i in ids if i] # Retornar a lista de IDs encontrados
+                
+                if not ids and allow_global_fallback:
+                    ids.extend(
+                        el_id for el_id in elementos_cache.keys()
+                        if el_id.startswith('data_') and elementos_cache[el_id].name == 'textarea'
+                    )
+                
+                return [i for i in ids if i]
 
-            def parse_all_textareas(textarea_ids): # Parseia todas as textareas dadas pelos IDs e combina os resultados, removendo duplicatas
-                combined, seen = [], set() # Listas para resultados combinados e conjunto para rastrear vistos
-                for ta_id in textarea_ids: # Iterar sobre cada ID de textarea
-                    parsed = parse_data_textarea_soup(soup, ta_id) # Parsear o conteúdo da textarea
-                    for entry in parsed: # Iterar sobre cada entrada parseada
-                        entry = entry.strip() # Remover espaços extras
-                        if entry and entry not in seen: # Se a entrada não for vazia e não tiver sido vista antes
-                            seen.add(entry) # Marcar como visto
-                            combined.append(entry) # Adicionar à lista combinada
-                return combined or [" "] # Retornar a lista combinada ou uma lista com espaço se vazia
+            def parse_all_textareas(textarea_ids):
+                combined, seen = [], set()
+                for ta_id in textarea_ids:
+                    parsed = parse_data_textarea_soup(ta_id)
+                    for entry in parsed:
+                        entry = entry.strip()
+                        if entry and entry not in seen:
+                            seen.add(entry)
+                            combined.append(entry)
+                return combined or [" "]
 
-            # Extrair dados na mesma ordem do Selenium
-            numero_chamado = get_text("div_Codigo__", buscar_em_pai=True)  # Número do chamado
-            data_inicial = get_text("var_DadosDaSolicitacao__Responsavel__data__").replace('Data.:', '').replace('Data:', '').strip() # Data inicial
-            responsavel = get_text("var_DadosDaSolicitacao__Responsavel__responsavel__") # Responsável pela solicitação
-            detalhes_solicitacao = get_text("var_DadosDaSolicitacao__DescricaoDaDemanda___view_textarea") # Detalhes da solicitação
-            uo = '' # Unidade Organizacional
-            if detalhes_solicitacao: # Tentar extrair UO dos detalhes da solicitação
+            # ✅ Extração com prints de progresso
+
+            numero_chamado = get_text_cached("div_Codigo__", buscar_em_pai=True)
+
+            data_inicial = get_text_cached("var_DadosDaSolicitacao__Responsavel__data__").replace('Data.:', '').replace('Data:', '').strip()
+
+            responsavel = get_text_cached("var_DadosDaSolicitacao__Responsavel__responsavel__")
+
+            detalhes_solicitacao = get_text_cached("var_DadosDaSolicitacao__DescricaoDaDemanda___view_textarea")
+            uo = ''
+            if detalhes_solicitacao:
                 for uo_unidade in uo_dict.uo_dict:
                     pattern = rf'(?<!\d){uo_unidade}(?!\d)'
                     if re.search(pattern, detalhes_solicitacao):
                         uo = str(uo_unidade)
                         break
-            if detalhes_solicitacao == "": # Tentar extrair detalhes da solicitação alternativos
-                detalhes_solicitacao = get_text("var_DadosDaSolicitacao__NecessidadeDeCompras__JustificativaDaDefinicaoDeUrgencia___view_textarea", buscar_em_pai=True) # Detalhes da solicitação alternativos
-            urgencia_demanda = get_text("label_DadosDaSolicitacao__UrgenciaDemanda__").replace('Urgência da Demanda:', '').strip() # Urgência da demanda
-            if urgencia_demanda == "": # Tentar extrair urgência da demanda alternativos
-                urgencia_demanda = get_text("label_DadosDaSolicitacao__VariacoesDaDemanda__").replace('Urgência da Demanda:', '').strip() # Urgência da demanda alternativos
-            justificativa_demanda = get_text("var_DadosDaSolicitacao__JustificativaDaDefinicaoDeUrgencia___view_textarea") # Justificativa da demanda
-            if justificativa_demanda == "": # Tentar extrair justificativa da demanda alternativos
-                justificativa_demanda = get_text("var_DadosDaSolicitacao__NecessidadeDeCompras__JustificativaDaNecessidadeDeCompra___view_textarea", buscar_em_pai=True) # Justificativa da demanda alternativos
-            data_atual_supervisor = get_text("var_SupervisorAnalise__DataAtual__").replace('Data Atual:', '').strip() # Data atual do supervisor
-            prazo_final = get_text("var_SupervisorAnalise__PrazoDeAtendimento__").replace('Prazo de Atendimento:', '').strip() # Prazo final
-            supervisor_ids = get_data_textarea_ids_from_soup(
-                soup, 'dlist_SupervisorAnalise__HistoricoDeAtendimentoNucleoAdministrativo__'
-            ) # IDs das textareas do supervisor
-            supervisor_ids_alt = get_data_textarea_ids_from_soup(
-                soup, 'dlist_SupervisorAnalise__HistoricoDeAtendimento__'
-            ) # IDs das textareas do supervisor alternativos
-            nucleo_ids = get_data_textarea_ids_from_soup(
-                soup, 'dlist_NucleoAdministrativoAnalise__Historico__', allow_global_fallback=False
-            ) # IDs das textareas do núcleo administrativo
-            historico_nucleo = parse_all_textareas(nucleo_ids) # Histórico do núcleo administrativo
-            encaminhamento_supervisor = parse_all_textareas(supervisor_ids) # Encaminhamento do supervisor
-            if encaminhamento_supervisor == [" "]: # Tentar extrair encaminhamento do supervisor alternativos
-                encaminhamento_supervisor = parse_all_textareas(supervisor_ids_alt) # Encaminhamento do supervisor alternativos
-            acao_supervisor = get_text("label_SupervisorAnalise__Acao__").replace('Ação:', '').strip() # Ação do supervisor
-            responsavel_nucleo = get_text("var_NucleoAdministrativoAnalise__Responsavel__responsavel__") # Responsável do núcleo administrativo
-            acao_nucleo = get_text("label_NucleoAdministrativoAnalise__Acoes__").replace('Ação:', '').strip() # Ação do núcleo administrativo
+            
+            if detalhes_solicitacao == "":
+                detalhes_solicitacao = get_text_cached("var_DadosDaSolicitacao__NecessidadeDeCompras__JustificativaDaDefinicaoDeUrgencia___view_textarea", buscar_em_pai=True)
+            
+            print("  ⏳ Extraindo: Urgência da demanda...")
+            urgencia_demanda = get_text_cached("label_DadosDaSolicitacao__UrgenciaDemanda__").replace('Urgência da Demanda:', '').strip()
+            if urgencia_demanda == "":
+                urgencia_demanda = get_text_cached("label_DadosDaSolicitacao__VariacoesDaDemanda__").replace('Urgência da Demanda:', '').strip()
+            
+            print("  ⏳ Extraindo: Justificativa da demanda...")
+            justificativa_demanda = get_text_cached("var_DadosDaSolicitacao__JustificativaDaDefinicaoDeUrgencia___view_textarea")
+            if justificativa_demanda == "":
+                justificativa_demanda = get_text_cached("var_DadosDaSolicitacao__NecessidadeDeCompras__JustificativaDaNecessidadeDeCompra___view_textarea", buscar_em_pai=True)
+            
+            print("  ⏳ Extraindo: Datas do supervisor...")
+            data_atual_supervisor = get_text_cached("var_SupervisorAnalise__DataAtual__").replace('Data Atual:', '').strip()
+            prazo_final = get_text_cached("var_SupervisorAnalise__PrazoDeAtendimento__").replace('Prazo de Atendimento:', '').strip()
+            
+            print("  ⏳ Extraindo: IDs de textareas do supervisor...")
+            supervisor_ids = get_data_textarea_ids_from_soup('dlist_SupervisorAnalise__HistoricoDeAtendimentoNucleoAdministrativo__')
+            supervisor_ids_alt = get_data_textarea_ids_from_soup('dlist_SupervisorAnalise__HistoricoDeAtendimento__')
+            
+            print("  ⏳ Extraindo: IDs de textareas do núcleo...")
+            nucleo_ids = get_data_textarea_ids_from_soup('dlist_NucleoAdministrativoAnalise__Historico__', allow_global_fallback=False)
+            
+            print("  ⏳ Parseando: Histórico do núcleo...")
+            historico_nucleo = parse_all_textareas(nucleo_ids)
+            
+            print("  ⏳ Parseando: Encaminhamento do supervisor...")
+            encaminhamento_supervisor = parse_all_textareas(supervisor_ids)
+            if encaminhamento_supervisor == [" "]:
+                encaminhamento_supervisor = parse_all_textareas(supervisor_ids_alt)
+            
+            print("  ⏳ Extraindo: Ações...")
+            acao_supervisor = get_text_cached("label_SupervisorAnalise__Acao__").replace('Ação:', '').strip()
+            responsavel_nucleo = get_text_cached("var_NucleoAdministrativoAnalise__Responsavel__responsavel__")
+            acao_nucleo = get_text_cached("label_NucleoAdministrativoAnalise__Acoes__").replace('Ação:', '').strip()
+            
+            print(f"✅ Extração concluída: {nome_arquivo}")
             
             return [
-                numero_chamado, setor ,data_inicial, responsavel, uo, detalhes_solicitacao,
+                numero_chamado, setor, data_inicial, responsavel, uo, detalhes_solicitacao,
                 urgencia_demanda, justificativa_demanda, data_atual_supervisor, prazo_final,
                 encaminhamento_supervisor, acao_supervisor, historico_nucleo, responsavel_nucleo, acao_nucleo, '', ''
-            ] # Retorna os dados extraídos em uma lista na ordem correta
+            ]
             
         except Exception as e:
+            print(f"❌ Erro na extração de {nome_arquivo}: {e}")
             return None
         
     def obter_entity_id_do_processo(self, session, headers, process_id):
@@ -659,3 +690,92 @@ class RoboRequest:
         except Exception as e:
             print(f"❌ Erro na requisição para processo {process_id}: {e}")
             return None
+    
+    def obter_entity_ids_batch(self, session, headers, process_ids_dict):
+        """Obtém múltiplos EntityIDs em paralelo com rate limiting"""
+        results = {}
+        total = len(process_ids_dict)
+        processados = 0
+        
+        def fetch_with_limit(idx, process_code, process_id):
+            self.rate_limiter.acquire()
+            time.sleep(self.request_interval)
+            try:
+                print(f"  [{idx}/{total}] 🔍 Buscando EntityID para {process_code} (ProcessID: {process_id})...")
+                entity_id = self.obter_entity_id_do_processo(session, headers, str(process_id))
+                
+                if entity_id:
+                    print(f"  [{idx}/{total}] ✅ {process_code} → EntityID: {entity_id}")
+                    return process_code, entity_id
+                else:
+                    print(f"  [{idx}/{total}] ❌ {process_code} → EntityID não encontrado")
+                    return process_code, None
+            except Exception as e:
+                print(f"  [{idx}/{total}] ❌ {process_code} → Erro: {e}")
+                return process_code, None
+            finally:
+                self.rate_limiter.release()
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {
+                executor.submit(fetch_with_limit, idx, code, pid): code 
+                for idx, (code, pid) in enumerate(process_ids_dict.items(), 1)
+            }
+            
+            for future in as_completed(futures):
+                code, entity_id = future.result()
+                if entity_id:
+                    results[code] = int(entity_id)
+                
+                processados += 1
+                # Print de progresso a cada 10 itens
+                if processados % 10 == 0 or processados == total:
+                    print(f"\n📊 Progresso: {processados}/{total} processos ({(processados/total)*100:.1f}%)")
+                    print(f"   ✅ EntityIDs obtidos: {len(results)}")
+                    print(f"   ❌ Falhas: {processados - len(results)}\n")
+        
+        return results
+    
+    def baixar_dados_processos_batch(self, session, headers, dict_processos, setor_dir):
+        """Baixa dados de múltiplos processos em paralelo"""
+        erros = 0
+        total = len(dict_processos)
+        
+        def fetch_processo(idx, processo, entity_id):
+            self.rate_limiter.acquire()
+            time.sleep(self.request_interval)
+            try:
+                print(f"[{idx}/{total}] 📥 {processo} (EntityID: {entity_id})")
+                resultado = self.fazer_requisicao_fusion(session, headers, str(entity_id))
+                
+                html_completo = resultado.get('full_html', '')
+                if html_completo:
+                    salvar_resposta_em_txt(resultado, os.path.join(setor_dir, f"resposta_fusion_{entity_id}.txt"))
+                    print(f"✅ Arquivo salvo")
+                    return True
+                return False
+            finally:
+                self.rate_limiter.release()
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {
+                executor.submit(fetch_processo, idx, proc, eid): proc
+                for idx, (proc, eid) in enumerate(dict_processos.items(), 1)
+            }
+            
+            for future in as_completed(futures):
+                if not future.result():
+                    erros += 1
+        
+        return erros
+    
+    def processar_arquivos_batch(self, setor, lista_arquivos):
+        """Processa múltiplos arquivos em paralelo"""
+        
+        def processar_arquivo(nome_arquivo):
+            return self.extrair_dados_do_txt(setor, nome_arquivo)
+        
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            resultados = list(executor.map(processar_arquivo, lista_arquivos))
+        
+        return resultados
