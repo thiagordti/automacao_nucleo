@@ -402,7 +402,7 @@ def salvar_lista_historico_xlsx(lista_historico, caminho_arquivo, sheet_name='Pl
     cols = [
         'numero_chamado','setor','data_inicial','responsavel','uo','detalhes_solicitacao',
         'urgencia_demanda','justificativa_demanda','data_atual_supervisor','prazo_final',
-        'encaminhamento_supervisor','acao_supervisor','historico_nucleo','responsavel_nucleo','acao_nucleo', 'sc', 'pedido_protheus'
+        'encaminhamento_supervisor','acao_supervisor','historico_nucleo','responsavel_nucleo','acao_nucleo', 'nota_atendimento', 'justificativa_pesquisa'
     ]
 
     def _cell_to_str(v):
